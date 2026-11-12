@@ -11,7 +11,10 @@
   #ui img{width:38vw;max-width:180px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,.15)}
   #start{font-size:18px;padding:14px 36px;border:0;border-radius:999px;background:#111;color:#fff}
   #start:disabled{opacity:.4}
-  #hint{position:absolute;left:0;right:0;bottom:28px;text-align:center;color:#fff;font-size:14px;text-shadow:0 1px 3px #000;z-index:5;display:none}
+  #zoom{position:absolute;right:16px;bottom:24px;z-index:6;display:none;flex-direction:column;align-items:center;gap:10px}
+  #zoom button{width:52px;height:52px;border-radius:50%;border:0;background:rgba(0,0,0,.55);color:#fff;font-size:28px;line-height:52px;padding:0;-webkit-tap-highlight-color:transparent}
+  #zoom span{color:#fff;font-size:12px;text-shadow:0 1px 2px #000}
+  #hint{position:absolute;left:0;right:80px;bottom:28px;text-align:center;color:#fff;font-size:14px;text-shadow:0 1px 3px #000;z-index:5;display:none}
 </style>
 <script type="importmap">
 {"imports":{
@@ -23,6 +26,7 @@
 </head>
 <body>
 <div id="ar"></div>
+<div id="zoom"><button id="zin" aria-label="크게">+</button><span id="zval">100%</span><button id="zout" aria-label="작게">−</button></div>
 <div id="hint">카드의 사각 프레임 전체가 화면에 들어오게 비춰 주세요</div>
 <div id="ui">
   <img src="marker.png" alt="marker">
@@ -39,11 +43,21 @@ import * as THREE from 'three';
 import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
 import {DRACOLoader} from 'three/addons/loaders/DRACOLoader.js';
 import {MindARThree} from 'mindar-image-three';
+import {attachAutoFocal} from './autofocal.js';
 
 const SKIP_START = 0.1;   // 첫 프레임 T포즈 건너뛰기(초)
-const CHAR_HEIGHT = 0.6;  // 마커 가로폭 = 1 기준 캐릭터 키 (크기 조절은 이 값)
+const STAGE_FIT = 0.9;    // 안무 전체 이동 범위가 프레임 안쪽의 몇 %를 쓰게 할지 (크기 조절은 이 값)
 
 const $ = id => document.getElementById(id);
+
+// 카메라 화각(폰 카메라 긴 변 기준, 도). MindAR 기본값(45° 고정)은 폰에서 축이 틀어짐 → 66°로 보정
+// 시작값일 뿐이며, 카드를 비스듬히 비추면 autofocal.js가 프레임 원근으로 실제 화각을 자동 계산해 교체한다.
+// ?debug 를 붙이면 프레임 외곽선·안무 범위·축·추정 화각 표시
+const Q = new URLSearchParams(location.search);
+const FOV = +Q.get('fov') || 66;
+const DEBUG = Q.has('debug');
+window.MINDAR_FOV_LONG = FOV;
+const FRAME_HALF = 830 / 1800;   // 인쇄 카드에서 검은 프레임 바깥선 위치(카드 가로폭=1 기준)
 
 // 1) 암호화된 캐릭터 다운로드
 async function download(url) {
@@ -91,20 +105,37 @@ $('start').disabled = false;
 
 // 2) 캐릭터 배치: 마커(XY 평면) 위에 서도록 +90° 회전
 const model = gltf.scene;
-const box = new THREE.Box3().setFromObject(model, true);
-const s = CHAR_HEIGHT / (box.max.y - box.min.y);
-model.scale.setScalar(s);
-model.position.y = -box.min.y * s;
-const holder = new THREE.Group();
-holder.add(model);
-holder.rotation.x = Math.PI / 2;
-holder.visible = false;
-
+model.traverse(o => { if (o.isMesh) o.frustumCulled = false; });   // 스키닝 메시가 잘못 잘려나가는 것 방지
 const mixer = new THREE.AnimationMixer(model);
 const clip = gltf.animations[0];
 const action = mixer.clipAction(clip);
 action.play();
 mixer.setTime(SKIP_START);
+// 무대 = 애니메이션 원점(씬 원점)을 프레임 중심에 그대로 둠. 데이터는 손대지 않고 재생.
+// 안무 전체를 훑어 본(관절)들의 이동 범위를 구하고, 그 범위가 프레임 안에 들어오도록 무대 전체를 균일 축소
+const STAGE = {minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity, maxY: 0};
+const bones = []; model.traverse(o => { if (o.isBone) bones.push(o); });
+const v = new THREE.Vector3();
+for (let t = 0; t <= clip.duration; t += 1 / 12) {
+  mixer.setTime(t); model.updateMatrixWorld(true);
+  for (const bn of bones) {
+    bn.getWorldPosition(v);
+    STAGE.minX = Math.min(STAGE.minX, v.x); STAGE.maxX = Math.max(STAGE.maxX, v.x);
+    STAGE.minZ = Math.min(STAGE.minZ, v.z); STAGE.maxZ = Math.max(STAGE.maxZ, v.z);
+    STAGE.maxY = Math.max(STAGE.maxY, v.y);
+  }
+}
+mixer.setTime(SKIP_START);
+const margin = STAGE.maxY * 0.08;   // 관절 바깥으로 나오는 몸·옷 두께 여유
+const reach = Math.max(-STAGE.minX, STAGE.maxX, -STAGE.minZ, STAGE.maxZ) + margin;
+const s = (FRAME_HALF - 0.02) * STAGE_FIT / reach;
+model.scale.setScalar(s);           // 위치는 원점 그대로
+window.stageInfo = {...STAGE, reach, scale: s, charHeight: STAGE.maxY * s};
+const holder = new THREE.Group();
+holder.add(model);
+holder.rotation.x = Math.PI / 2;
+holder.visible = false;
+
 mixer.addEventListener('loop', () => { action.time = SKIP_START; });
 
 // 3) AR 시작
@@ -112,7 +143,7 @@ $('start').onclick = async () => {
   $('start').disabled = true; $('msg').textContent = '카메라 여는 중…';
   const mindar = new MindARThree({
     container: $('ar'), imageTargetSrc: './marker.mind',
-    uiScanning: 'no', uiLoading: 'no', filterMinCF: 0.0001, filterBeta: 0.001
+    uiScanning: 'no', uiLoading: 'no', filterMinCF: 0.001, filterBeta: 10
   });
   const {renderer, scene, camera} = mindar;
   renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -121,6 +152,20 @@ $('start').onclick = async () => {
 
   const anchor = mindar.addAnchor(0);
   anchor.group.add(holder);
+  if (DEBUG) {
+    const f = FRAME_HALF, pts = [[-f,-f],[f,-f],[f,f],[-f,f]].map(([x,y]) => new THREE.Vector3(x, y, 0.002));
+    anchor.group.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({color: 0xff0044})));
+    anchor.group.add(new THREE.AxesHelper(0.3));
+    // 노랑: 안무 이동 범위(관절 기준). 무대 좌표 x→카드 X, z→카드 -Y
+    const S = STAGE, k = s, foot = [[S.minX, S.minZ], [S.maxX, S.minZ], [S.maxX, S.maxZ], [S.minX, S.maxZ]].map(([x, z]) => new THREE.Vector3(x * k, -z * k, 0.003));
+    anchor.group.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(foot), new THREE.LineBasicMaterial({color: 0xffcc00})));   // 빨강=X(카드 오른쪽), 초록=Y(카드 위쪽), 파랑=Z(카드에서 수직으로 위)
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.6), new THREE.MeshBasicMaterial({color: 0x00aaff}));
+    pole.rotation.x = Math.PI / 2; pole.position.set(-f + 0.05, -f + 0.05, 0.3); anchor.group.add(pole);
+    const panel = document.createElement('div');
+    panel.style.cssText = 'position:absolute;top:10px;left:10px;right:10px;z-index:20;color:#fff;font:14px sans-serif;text-shadow:0 1px 2px #000;display:flex;gap:6px;align-items:center;flex-wrap:wrap';
+    panel.innerHTML = `<span id="dbg">FOV ${FOV}°</span>`;
+    document.body.appendChild(panel);
+  }
   anchor.onTargetFound = () => { holder.visible = true; $('hint').style.display = 'none'; };
   anchor.onTargetLost  = () => { holder.visible = false; $('hint').style.display = 'block'; };
 
@@ -128,12 +173,26 @@ $('start').onclick = async () => {
   catch (e) { $('msg').textContent = '카메라를 열 수 없어요: ' + e.message; $('start').disabled = false; return; }
   $('ui').style.display = 'none'; $('hint').style.display = 'block';
 
+  // 전체 무대 크기 +/- (원점=프레임 중심 기준으로 균일 확대·축소)
+  let zoom = 1;
+  const setZoom = z => { zoom = Math.min(4, Math.max(0.3, z)); holder.scale.setScalar(zoom); $('zval').textContent = Math.round(zoom * 100) + '%'; };
+  $('zin').onclick = () => setZoom(zoom * 1.15);
+  $('zout').onclick = () => setZoom(zoom / 1.15);
+  $('zoom').style.display = 'flex';
+
   const clock = new THREE.Clock();
   renderer.setAnimationLoop(() => {
     const dt = clock.getDelta();
     if (holder.visible) mixer.update(dt);
     renderer.render(scene, camera);
   });
+  const c = mindar.controller;
+  const info = (extra = '') => DEBUG && ($('dbg').textContent = `화각 ${af.fovLong.toFixed(1)}° (샘플 ${af.samples}) · 영상 ${c.inputWidth}×${c.inputHeight} · 무대 축척 ${s.toFixed(3)} ${extra}`);
+  const af = attachAutoFocal(mindar, {
+    onChange: (fov) => { window.fovApplied = fov; info('· 갱신됨'); },
+    onSample: (r, fov) => { window.lastSample = {fov, tilt: r.tilt}; info(`· 측정 ${fov.toFixed(1)}° 기울기 ${r.tilt.toFixed(0)}°`); }
+  });
+  window.af = af;
   window.status = 'running';
 };
 window.status = 'ready';
