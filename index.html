@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Naevis Chiby AR</title>
+<style>
+  html{background:#000} body{margin:0;height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",sans-serif}
+  #ar{position:absolute;inset:0;z-index:0;overflow:hidden}
+  #ui{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;background:#fff;color:#111;z-index:10;text-align:center;padding:24px;box-sizing:border-box}
+  #ui img{width:38vw;max-width:180px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,.15)}
+  #start{font-size:18px;padding:14px 36px;border:0;border-radius:999px;background:#111;color:#fff}
+  #start:disabled{opacity:.4}
+  #hint{position:absolute;left:0;right:0;bottom:28px;text-align:center;color:#fff;font-size:14px;text-shadow:0 1px 3px #000;z-index:5;display:none}
+</style>
+<script type="importmap">
+{"imports":{
+  "three":"./lib/three/three.module.js",
+  "three/addons/":"./lib/three/addons/",
+  "mindar-image-three":"./lib/mindar/mindar-image-three.prod.js"
+}}
+</script>
+</head>
+<body>
+<div id="ar"></div>
+<div id="hint">카드의 사각 프레임 전체가 화면에 들어오게 비춰 주세요</div>
+<div id="ui">
+  <img src="marker.png" alt="marker">
+  <div id="msg">캐릭터 불러오는 중… <span id="pct">0</span>%</div>
+  <form id="pwbox" style="display:none;gap:8px">
+    <input id="pw" type="password" placeholder="비밀번호" autocomplete="off" style="font-size:16px;padding:10px 14px;border:1px solid #ccc;border-radius:8px">
+    <button style="font-size:16px;padding:10px 18px;border:0;border-radius:8px;background:#111;color:#fff">확인</button>
+  </form>
+  <button id="start" disabled>AR 시작</button>
+  <div style="font-size:12px;color:#888">카메라 권한을 허용해 주세요</div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import {DRACOLoader} from 'three/addons/loaders/DRACOLoader.js';
+import {MindARThree} from 'mindar-image-three';
+
+const SKIP_START = 0.1;   // 첫 프레임 T포즈 건너뛰기(초)
+const CHAR_HEIGHT = 0.6;  // 마커 가로폭 = 1 기준 캐릭터 키 (크기 조절은 이 값)
+
+const $ = id => document.getElementById(id);
+
+// 1) 암호화된 캐릭터 다운로드
+async function download(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('다운로드 실패 ' + r.status);
+  const total = +r.headers.get('content-length') || 0;
+  const reader = r.body.getReader(); const chunks = []; let got = 0;
+  for (;;) {
+    const {done, value} = await reader.read(); if (done) break;
+    chunks.push(value); got += value.length;
+    if (total) $('pct').textContent = Math.min(100, Math.round(got / total * 100));
+  }
+  const buf = new Uint8Array(got); let o = 0; for (const c of chunks) { buf.set(c, o); o += c.length; }
+  return buf;
+}
+// 형식: 'NVE1' | salt16 | iv12 | AES-GCM 암호문  (tools/encrypt_glb.py와 동일)
+async function decrypt(buf, password) {
+  const salt = buf.slice(4, 20), iv = buf.slice(20, 32), ct = buf.slice(32);
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+  const key = await crypto.subtle.deriveKey({name: 'PBKDF2', salt, iterations: 200000, hash: 'SHA-256'},
+    base, {name: 'AES-GCM', length: 256}, false, ['decrypt']);
+  return crypto.subtle.decrypt({name: 'AES-GCM', iv}, key, ct);
+}
+const askPassword = (msg) => new Promise(res => {
+  $('msg').textContent = msg; $('pwbox').style.display = 'flex'; $('pw').focus();
+  $('pwbox').onsubmit = e => { e.preventDefault(); $('pwbox').style.display = 'none'; res($('pw').value); };
+});
+
+const enc = await download('naevis.glb.enc');
+// QR 주소의 #k=… 로 자동 잠금해제 (# 뒤는 서버로 전송되지 않음). 읽은 뒤 주소창에서 지움
+let password = new URLSearchParams(location.hash.slice(1)).get('k');
+if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+let glbData = null;
+for (let msg = '비밀번호를 입력해 주세요'; !glbData; msg = '비밀번호가 맞지 않아요') {
+  if (!password) password = await askPassword(msg);
+  $('msg').textContent = '잠금 해제 중…';
+  try { glbData = await decrypt(enc, password); } catch { password = null; }
+}
+
+const loader = new GLTFLoader();
+const draco = new DRACOLoader(); draco.setDecoderPath('./lib/draco/'); loader.setDRACOLoader(draco);
+const gltf = await new Promise((res, rej) => loader.parse(glbData, './', res, rej));
+$('msg').textContent = '준비 완료';
+$('start').disabled = false;
+
+// 2) 캐릭터 배치: 마커(XY 평면) 위에 서도록 +90° 회전
+const model = gltf.scene;
+const box = new THREE.Box3().setFromObject(model, true);
+const s = CHAR_HEIGHT / (box.max.y - box.min.y);
+model.scale.setScalar(s);
+model.position.y = -box.min.y * s;
+const holder = new THREE.Group();
+holder.add(model);
+holder.rotation.x = Math.PI / 2;
+holder.visible = false;
+
+const mixer = new THREE.AnimationMixer(model);
+const clip = gltf.animations[0];
+const action = mixer.clipAction(clip);
+action.play();
+mixer.setTime(SKIP_START);
+mixer.addEventListener('loop', () => { action.time = SKIP_START; });
+
+// 3) AR 시작
+$('start').onclick = async () => {
+  $('start').disabled = true; $('msg').textContent = '카메라 여는 중…';
+  const mindar = new MindARThree({
+    container: $('ar'), imageTargetSrc: './marker.mind',
+    uiScanning: 'no', uiLoading: 'no', filterMinCF: 0.0001, filterBeta: 0.001
+  });
+  const {renderer, scene, camera} = mindar;
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x777777, 2.2));
+  const dl = new THREE.DirectionalLight(0xffffff, 1.4); dl.position.set(0.5, 1, 1.5); scene.add(dl);
+
+  const anchor = mindar.addAnchor(0);
+  anchor.group.add(holder);
+  anchor.onTargetFound = () => { holder.visible = true; $('hint').style.display = 'none'; };
+  anchor.onTargetLost  = () => { holder.visible = false; $('hint').style.display = 'block'; };
+
+  try { await mindar.start(); }
+  catch (e) { $('msg').textContent = '카메라를 열 수 없어요: ' + e.message; $('start').disabled = false; return; }
+  $('ui').style.display = 'none'; $('hint').style.display = 'block';
+
+  const clock = new THREE.Clock();
+  renderer.setAnimationLoop(() => {
+    const dt = clock.getDelta();
+    if (holder.visible) mixer.update(dt);
+    renderer.render(scene, camera);
+  });
+  window.status = 'running';
+};
+window.status = 'ready';
+</script>
+</body>
+</html>
