@@ -151,16 +151,33 @@ $('start').onclick = async () => {
   const dl = new THREE.DirectionalLight(0xffffff, 1.4); dl.position.set(0.5, 1, 1.5); scene.add(dl);
 
   const anchor = mindar.addAnchor(0);
-  anchor.group.add(holder);
+  // 떨림 보정: 캐릭터는 앵커에 직접 붙이지 않고, 앵커 자세를 부드럽게 따라가는 stage 그룹에 붙인다.
+  // 거의 정지 상태(작은 흔들림)는 강하게 눌러주고, 폰을 크게 움직이면 바로 따라가게 속도에 따라 보정 강도를 바꾼다.
+  const stage = new THREE.Group(); stage.visible = false; scene.add(stage);
+  stage.add(holder);
+  const tp = new THREE.Vector3(), tq = new THREE.Quaternion(), ts = new THREE.Vector3();
+  let snap = true;
+  const followAnchor = dt => {
+    if (!anchor.group.visible) { stage.visible = false; snap = true; return; }
+    anchor.group.matrix.decompose(tp, tq, ts);
+    if (snap) { stage.position.copy(tp); stage.quaternion.copy(tq); stage.scale.copy(ts); snap = false; }
+    else {
+      const move = tp.distanceTo(stage.position) / ts.x + stage.quaternion.angleTo(tq);   // 카드 폭 기준 이동량 + 회전(rad)
+      const k = THREE.MathUtils.mapLinear(THREE.MathUtils.clamp(move, 0.004, 0.06), 0.004, 0.06, 3, 22);
+      const a = 1 - Math.exp(-k * dt);
+      stage.position.lerp(tp, a); stage.quaternion.slerp(tq, a); stage.scale.lerp(ts, a);
+    }
+    stage.visible = true;
+  };
   if (DEBUG) {
     const f = FRAME_HALF, pts = [[-f,-f],[f,-f],[f,f],[-f,f]].map(([x,y]) => new THREE.Vector3(x, y, 0.002));
-    anchor.group.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({color: 0xff0044})));
-    anchor.group.add(new THREE.AxesHelper(0.3));
+    stage.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({color: 0xff0044})));
+    stage.add(new THREE.AxesHelper(0.3));
     // 노랑: 안무 이동 범위(관절 기준). 무대 좌표 x→카드 X, z→카드 -Y
     const S = STAGE, k = s, foot = [[S.minX, S.minZ], [S.maxX, S.minZ], [S.maxX, S.maxZ], [S.minX, S.maxZ]].map(([x, z]) => new THREE.Vector3(x * k, -z * k, 0.003));
-    anchor.group.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(foot), new THREE.LineBasicMaterial({color: 0xffcc00})));   // 빨강=X(카드 오른쪽), 초록=Y(카드 위쪽), 파랑=Z(카드에서 수직으로 위)
+    stage.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(foot), new THREE.LineBasicMaterial({color: 0xffcc00})));   // 빨강=X(카드 오른쪽), 초록=Y(카드 위쪽), 파랑=Z(카드에서 수직으로 위)
     const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.6), new THREE.MeshBasicMaterial({color: 0x00aaff}));
-    pole.rotation.x = Math.PI / 2; pole.position.set(-f + 0.05, -f + 0.05, 0.3); anchor.group.add(pole);
+    pole.rotation.x = Math.PI / 2; pole.position.set(-f + 0.05, -f + 0.05, 0.3); stage.add(pole);
     const panel = document.createElement('div');
     panel.style.cssText = 'position:absolute;top:10px;left:10px;right:10px;z-index:20;color:#fff;font:14px sans-serif;text-shadow:0 1px 2px #000;display:flex;gap:6px;align-items:center;flex-wrap:wrap';
     panel.innerHTML = `<span id="dbg">FOV ${FOV}°</span>`;
@@ -182,7 +199,8 @@ $('start').onclick = async () => {
 
   const clock = new THREE.Clock();
   renderer.setAnimationLoop(() => {
-    const dt = clock.getDelta();
+    const dt = Math.min(clock.getDelta(), 0.1);
+    followAnchor(dt);
     if (holder.visible) mixer.update(dt);
     renderer.render(scene, camera);
   });
@@ -193,6 +211,7 @@ $('start').onclick = async () => {
     onSample: (r, fov) => { window.lastSample = {fov, tilt: r.tilt}; info(`· 측정 ${fov.toFixed(1)}° 기울기 ${r.tilt.toFixed(0)}°`); }
   });
   window.af = af;
+  if (DEBUG) window._dbg = {stage, anchor, camera, THREE};
   window.status = 'running';
 };
 window.status = 'ready';

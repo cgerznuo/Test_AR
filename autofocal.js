@@ -58,9 +58,10 @@ export function attachAutoFocal(mindar, {onChange, onSample} = {}) {
   const longSide = Math.max(W, Hh);
   const fovLong = f => 2 * Math.atan(longSide / 2 / f) * 180 / Math.PI;
   const samples = [];
-  let frame = 0, applied = ctrl.projectionTransform[0][0], lastApply = 0;
+  let frame = 0, applied = ctrl.projectionTransform[0][0], lastApply = 0, updates = 0;
+  const MAX_UPDATES = 3;   // 수렴하면 고정 (계속 바뀌면 화면이 튐)
   ctrl.onCorrespondences = (world, screen) => {
-    if (++frame % 2) return;                          // 2프레임마다
+    if (updates >= MAX_UPDATES || ++frame % 2) return;  // 2프레임마다, 수렴 후엔 중단
     const H = homography(world, screen); if (!H) return;
     const r = focalFromH(H, cx, cy); if (!r) return;
     const fov = fovLong(r.f);
@@ -70,8 +71,9 @@ export function attachAutoFocal(mindar, {onChange, onSample} = {}) {
     if (samples.length < 12) return;
     const med = [...samples].sort((p, q) => p - q)[samples.length >> 1];
     const now = performance.now();
-    if (Math.abs(med - applied) / applied > 0.03 && now - lastApply > 1500) {
-      applied = med; lastApply = now;
+    if (Math.abs(med - applied) / applied <= 0.03) { updates = MAX_UPDATES; return; }   // 충분히 맞으면 고정
+    if (now - lastApply > 1500) {
+      applied = med; lastApply = now; updates++; samples.length = 0;
       ctrl.setFocal(med);
       mindar.resize();                                // 3D 카메라 화각도 갱신
       onChange && onChange(fovLong(med), med);
